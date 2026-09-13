@@ -286,7 +286,7 @@ fn nt_open(
     let mut buffer: Vec<u16> = name.to_vec();
     buffer.push(0);
     let name_length =
-        u16::try_from(name.len() * size_of::<u16>()).context("sandbox ACL path is too long")?;
+        u16::try_from(std::mem::size_of_val(name)).context("sandbox ACL path is too long")?;
     let maximum_length =
         u16::try_from(buffer.len() * size_of::<u16>()).context("sandbox ACL path is too long")?;
     let object_name = UNICODE_STRING {
