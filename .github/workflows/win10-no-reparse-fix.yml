@@ -204,8 +204,113 @@ jobs:
           Expand-Archive -Path $archive -DestinationPath $cargoBin -Force
           cargo nextest --version
 
-      - name: nextest run -p codex-windows-sandbox
-        run: cargo nextest run --locked -p codex-windows-sandbox --no-fail-fast
+      # Mirrors rust-ci-full-nextest-platform.yml: sandbox spawn tests need the
+      # setup helper and command runner binaries exposed via CARGO_BIN_EXE_*.
+      - name: Build runtime test helpers
+        run: cargo build --locked -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
+
+      - name: nextest run -p codex-windows-sandbox (with runtime helpers)
+        run: |
+          $env:CARGO_BIN_EXE_codex_windows_sandbox_setup = (Resolve-Path "target\debug\codex-windows-sandbox-setup.exe").Path
+          $env:CARGO_BIN_EXE_codex_command_runner = (Resolve-Path "target\debug\codex-command-runner.exe").Path
+          $env:RUST_BACKTRACE = "1"
+          $env:NEXTEST_STATUS_LEVEL = "leak"
+          Write-Host "CARGO_BIN_EXE_codex_windows_sandbox_setup=$env:CARGO_BIN_EXE_codex_windows_sandbox_setup"
+          Write-Host "CARGO_BIN_EXE_codex_command_runner=$env:CARGO_BIN_EXE_codex_command_runner"
+          cargo nextest run --locked -p codex-windows-sandbox --no-fail-fast
+
+  baseline-broader-tests:
+    # Informational: the same broader suite and harness on the unpatched
+    # upstream base commit, to classify any failure as pre-existing or patch-caused.
+    name: BASELINE unpatched f110a7a - broader codex-windows-sandbox tests (informational)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: codex-rs
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          ref: f110a7a85f43efc343f936f5bc504e01eb262550
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Configure rusty_v8 artifact overrides and verify checksums
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Install cargo-nextest 0.9.103 (version used by rust-ci-full)
+        run: |
+          $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+          $archive = Join-Path $env:RUNNER_TEMP "nextest.zip"
+          Invoke-WebRequest -Uri "https://get.nexte.st/0.9.103/windows" -OutFile $archive
+          Expand-Archive -Path $archive -DestinationPath $cargoBin -Force
+          cargo nextest --version
+
+      - name: Build runtime test helpers
+        run: cargo build --locked -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
+
+      - name: BASELINE nextest run -p codex-windows-sandbox (with runtime helpers)
+        run: |
+          git log -1 --format="BASELINE commit %H %s"
+          $env:CARGO_BIN_EXE_codex_windows_sandbox_setup = (Resolve-Path "target\debug\codex-windows-sandbox-setup.exe").Path
+          $env:CARGO_BIN_EXE_codex_command_runner = (Resolve-Path "target\debug\codex-command-runner.exe").Path
+          $env:RUST_BACKTRACE = "1"
+          $env:NEXTEST_STATUS_LEVEL = "leak"
+          cargo nextest run --locked -p codex-windows-sandbox --no-fail-fast
+
+  source-bundle:
+    # Local-build transport only: this network cannot fetch from github.com git or
+    # crates.io reliably, but downloads Actions artifacts quickly. The bundle is
+    # the exact commit tree plus `cargo vendor --locked` output (Cargo verifies
+    # every vendored crate against Cargo.lock checksums at build time) and the
+    # checksum-verified rusty_v8 Windows x64 artifacts used by rust-release.yml.
+    name: Source + vendored crates bundle (for local offline build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Configure rusty_v8 artifact overrides and verify checksums (Windows x64)
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Vendor crates and create bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="${RUNNER_TEMP}/bundle"
+          mkdir -p "${bundle}/rusty_v8"
+          git rev-parse HEAD > "${bundle}/HEAD.txt"
+          git ls-files -s > "${bundle}/git-ls-files-stage.txt"
+          git archive --format=tar -o "${bundle}/source.tar" HEAD
+          (cd codex-rs && cargo vendor --locked "${bundle}/vendor" > "${bundle}/cargo-vendor-config.toml")
+          cp "${RUSTY_V8_ARCHIVE}" "${RUSTY_V8_SRC_BINDING_PATH}" "${bundle}/rusty_v8/"
+          cp "$(dirname "${RUSTY_V8_ARCHIVE}")"/*.sha256 "${bundle}/rusty_v8/"
+          du -sh "${bundle}"/* || true
+          cd "${RUNNER_TEMP}"
+          tar -cf - bundle | zstd -10 -T0 -o openinterpreter-source-vendor.tar.zst
+          sha256sum openinterpreter-source-vendor.tar.zst | tee openinterpreter-source-vendor.tar.zst.sha256
+          ls -l openinterpreter-source-vendor.tar.zst
+
+      - uses: actions/upload-artifact@2848b2cda0e5190984587ec6bb1f36730ca78d50
+        with:
+          name: openinterpreter-source-vendor-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/openinterpreter-source-vendor.tar.zst
+            ${{ runner.temp }}/openinterpreter-source-vendor.tar.zst.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
 
   release-build:
     name: Build Windows x64 release package (rust-release.yml steps)
