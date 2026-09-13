@@ -1,0 +1,289 @@
+# TEMPORARY workflow for the fix/windows10-drive-root-no-reparse branch.
+#
+# Proves that the handle-relative no-reparse directory opener still rejects
+# junctions/symlinks while accepting normal drive-letter paths, then builds the
+# Windows x64 Open Interpreter package with the same steps as rust-release.yml.
+# It never publishes a release; the package is uploaded as a workflow artifact.
+
+name: win10-no-reparse-fix (temporary)
+
+on:
+  push:
+    branches:
+      - fix/windows10-drive-root-no-reparse
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: win10-no-reparse-fix-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: "8388608" # 8 MiB, matching the justfile/CI test recipes.
+
+jobs:
+  probe:
+    name: Probe OBJ_DONT_REPARSE drive-letter behavior (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Report OS build
+        shell: pwsh
+        run: |
+          (Get-CimInstance Win32_OperatingSystem) | Format-List Caption, Version, BuildNumber
+
+      - name: Probe (informational only)
+        shell: python
+        run: |
+          # Opens directories read-attributes-only, FILE_OPEN only; nothing is created.
+          import ctypes, os
+          from ctypes import wintypes
+
+          ntdll = ctypes.WinDLL("ntdll")
+          kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+          class UNICODE_STRING(ctypes.Structure):
+              _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", wintypes.LPWSTR)]
+
+          class OBJECT_ATTRIBUTES(ctypes.Structure):
+              _fields_ = [("Length", wintypes.ULONG), ("RootDirectory", wintypes.HANDLE),
+                          ("ObjectName", ctypes.POINTER(UNICODE_STRING)), ("Attributes", wintypes.ULONG),
+                          ("SecurityDescriptor", ctypes.c_void_p), ("SecurityQualityOfService", ctypes.c_void_p)]
+
+          class IO_STATUS_BLOCK(ctypes.Structure):
+              _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+          def nt_open(nt_path, attrs):
+              buf = ctypes.create_unicode_buffer(nt_path)
+              us = UNICODE_STRING(len(nt_path) * 2, (len(nt_path) + 1) * 2, ctypes.cast(buf, wintypes.LPWSTR))
+              oa = OBJECT_ATTRIBUTES(ctypes.sizeof(OBJECT_ATTRIBUTES), None, ctypes.pointer(us), attrs, None, None)
+              iosb = IO_STATUS_BLOCK()
+              h = wintypes.HANDLE()
+              status = ntdll.NtCreateFile(ctypes.byref(h), 0x80 | 0x100000, ctypes.byref(oa), ctypes.byref(iosb),
+                                          None, 0, 7, 1, 0x4000 | 0x20 | 0x200000, None, 0) & 0xFFFFFFFF
+              if status == 0:
+                  ntdll.NtClose(h)
+              return f"0x{status:08X}" + (" STATUS_REPARSE_POINT_ENCOUNTERED" if status == 0xC000050B else "")
+
+          nt_prefix = "\\??\\"
+          for path in [os.environ["SystemRoot"], os.environ["GITHUB_WORKSPACE"]]:
+              out = ctypes.create_unicode_buffer(1024)
+              kernel32.QueryDosDeviceW(path[:2], out, 1024)
+              print(f"=== {path} ({path[:2]} -> {out.value})")
+              print(f"  absolute \\??\\ + OBJ_DONT_REPARSE : {nt_open(nt_prefix + path, 0x40 | 0x1000)}")
+              print(f"  absolute \\??\\ without flag      : {nt_open(nt_prefix + path, 0x40)}")
+          print("If the first line is STATUS_REPARSE_POINT_ENCOUNTERED, this runner reproduces the Windows 10 bug.")
+
+  security-tests:
+    name: Security gate - no_reparse_dir regression tests
+    runs-on: windows-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: codex-rs
+        shell: pwsh
+    env:
+      # Repeat the drive-letter tests on the runner's D: work volume in addition
+      # to the default %TEMP% on C:.
+      CODEX_NO_REPARSE_TEST_ROOT: ${{ runner.temp }}\no-reparse-drive-test
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Toolchain
+        run: |
+          rustc -Vv
+          cargo -V
+
+      - name: rustfmt check (codex-windows-sandbox)
+        run: cargo fmt -p codex-windows-sandbox -- --check
+
+      - name: Configure rusty_v8 artifact overrides and verify checksums
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Build setup-helper test binary
+        run: cargo test --locked -p codex-windows-sandbox --bin codex-windows-sandbox-setup --no-run
+
+      - name: Verify every required regression test is present
+        run: |
+          $list = cargo test --locked -p codex-windows-sandbox --bin codex-windows-sandbox-setup -- --list --format terse 2>&1 | Out-String
+          $required = @(
+            'creates_and_opens_plain_directory_leaf',
+            'rejects_final_directory_junction',
+            'rejects_ancestor_directory_junction',
+            'creates_plain_directory_on_drive_letter_path',
+            'opens_existing_plain_directory',
+            'opens_multiple_nested_plain_directories',
+            'verbatim_drive_path_opens_same_directory',
+            'rejects_final_directory_junction_on_every_test_drive',
+            'rejects_deep_ancestor_directory_junction_on_every_test_drive',
+            'rejects_directory_symlink_component_when_symlinks_are_permitted',
+            'rejects_drive_letter_that_does_not_map_to_a_volume_root',
+            'rejects_non_local_or_non_normalized_paths',
+            'splits_drive_root_from_filesystem_components'
+          )
+          $missing = $required | Where-Object { $list -notmatch "no_reparse_dir::tests::$_\b" }
+          if ($missing) { Write-Error "Missing tests: $($missing -join ', ')"; exit 1 }
+          Write-Host "All $($required.Count) required no_reparse_dir tests are present."
+
+      - name: SECURITY GATE - junction/symlink/reparse rejection must hold
+        run: |
+          $out = cargo test --locked -p codex-windows-sandbox --bin codex-windows-sandbox-setup `
+            -- no_reparse_dir::tests::rejects_ --nocapture --test-threads=1 2>&1 | Tee-Object -Variable lines | Out-String
+          $lines | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0) { Write-Error "Rejection tests FAILED - stopping."; exit 1 }
+          if ($out -notmatch 'test result: ok\. 7 passed; 0 failed') { Write-Error "Expected exactly 7 rejection tests to pass."; exit 1 }
+          if ($out -match 'skipping:') { Write-Error "A rejection test was skipped (symlink or subst); the gate requires them to run."; exit 1 }
+
+      - name: Regression - normal drive-letter paths must open
+        run: |
+          $out = cargo test --locked -p codex-windows-sandbox --bin codex-windows-sandbox-setup `
+            -- no_reparse_dir::tests::creates_ no_reparse_dir::tests::opens_ no_reparse_dir::tests::verbatim_ no_reparse_dir::tests::splits_ `
+            --nocapture --test-threads=1 2>&1 | Tee-Object -Variable lines | Out-String
+          $lines | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if ($out -notmatch 'test result: ok\. 6 passed; 0 failed') { Write-Error "Expected exactly 6 positive tests to pass."; exit 1 }
+
+      - name: All no_reparse_dir tests
+        run: |
+          $out = cargo test --locked -p codex-windows-sandbox --bin codex-windows-sandbox-setup `
+            -- no_reparse_dir::tests:: --test-threads=1 2>&1 | Tee-Object -Variable lines | Out-String
+          $lines | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if ($out -notmatch 'test result: ok\. 13 passed; 0 failed') { Write-Error "Expected all 13 no_reparse_dir tests to pass."; exit 1 }
+
+      - name: clippy (codex-windows-sandbox, deny warnings)
+        run: cargo clippy --locked -p codex-windows-sandbox --tests -- -D warnings
+
+  broader-tests:
+    name: Broader codex-windows-sandbox test suite
+    needs: security-tests
+    runs-on: windows-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: codex-rs
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Configure rusty_v8 artifact overrides and verify checksums
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Install cargo-nextest 0.9.103 (version used by rust-ci-full)
+        run: |
+          $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+          $archive = Join-Path $env:RUNNER_TEMP "nextest.zip"
+          Invoke-WebRequest -Uri "https://get.nexte.st/0.9.103/windows" -OutFile $archive
+          Expand-Archive -Path $archive -DestinationPath $cargoBin -Force
+          cargo nextest --version
+
+      - name: nextest run -p codex-windows-sandbox
+        run: cargo nextest run --locked -p codex-windows-sandbox --no-fail-fast
+
+  release-build:
+    name: Build Windows x64 release package (rust-release.yml steps)
+    needs: [security-tests, broader-tests]
+    runs-on: windows-2025
+    timeout-minutes: 360
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CODEX_REPO_ROOT: ${{ github.workspace }}
+      CODEX_ZSH_RELEASE_TAG: codex-zsh-v0.1.0
+      CODEX_ZSH_MANIFEST_SHA256: c534eab89dcea7e3d8a5e5b3f49c025c7c64cd4e4d9814ee24871de58a9359a1
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install zstd
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-v1.5.7-win64.zip"
+          $zipPath = Join-Path $env:RUNNER_TEMP "zstd.zip"
+          $extractDir = Join-Path $env:RUNNER_TEMP "zstd"
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+          $zstd = Get-ChildItem -Path $extractDir -Recurse -Filter zstd.exe | Select-Object -First 1
+          if ($null -eq $zstd) {
+            throw "zstd.exe not found in downloaded archive"
+          }
+          $zstd.Directory.FullName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Configure rusty_v8 artifact overrides and verify checksums
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC
+          build_args=(--bin codex --bin codex-code-mode-host --bin codex-command-runner --bin codex-windows-sandbox-setup)
+          cargo build --locked --target "$TARGET" --release "${build_args[@]}" &
+          cargo_pid="$!"
+          while kill -0 "${cargo_pid}" 2>/dev/null; do
+            echo "cargo release build still running for ${TARGET} at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            sleep 60
+          done
+          wait "${cargo_pid}"
+
+      - name: Build package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "${GITHUB_WORKSPACE}/.github/scripts/build-codex-package-archive.sh" \
+            --target "$TARGET" \
+            --bundle open-interpreter \
+            --entrypoint-dir "target/${TARGET}/release" \
+            --archive-dir "dist/${TARGET}"
+
+      - name: Record hashes and sizes
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem "dist/$env:TARGET" -File
+          $files += Get-Item "target/$env:TARGET/release/codex-windows-sandbox-setup.exe"
+          "| File | Bytes | SHA-256 |" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "|---|---|---|" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          foreach ($f in $files) {
+            $hash = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "| $($f.Name) | $($f.Length) | $hash |" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            Write-Host "$($f.Name)  $($f.Length)  $hash"
+          }
+
+      - uses: actions/upload-artifact@2848b2cda0e5190984587ec6bb1f36730ca78d50
+        with:
+          name: open-interpreter-package-x86_64-pc-windows-msvc-win10-no-reparse-fix
+          path: codex-rs/dist/x86_64-pc-windows-msvc/*
+          if-no-files-found: error
+          retention-days: 14
