@@ -90,14 +90,19 @@ jobs:
       run:
         working-directory: codex-rs
         shell: pwsh
-    env:
-      # Repeat the drive-letter tests on the runner's D: work volume in addition
-      # to the default %TEMP% on C:.
-      CODEX_NO_REPARSE_TEST_ROOT: ${{ runner.temp }}\no-reparse-drive-test
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+
+      # The runner context is not available in job-level env, so export it here.
+      # Repeat the drive-letter tests on the runner's D: work volume in addition
+      # to the default %TEMP% on C:.
+      - name: Configure extra drive test root
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "no-reparse-drive-test"
+          Add-Content -Path $env:GITHUB_ENV -Value "CODEX_NO_REPARSE_TEST_ROOT=$root"
+          Write-Host "CODEX_NO_REPARSE_TEST_ROOT=$root"
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
