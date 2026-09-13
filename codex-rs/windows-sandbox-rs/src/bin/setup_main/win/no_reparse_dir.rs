@@ -106,9 +106,12 @@ unsafe extern "system" {
 /// mutation stays bound to the directory that passed this validation.
 pub(super) fn open_or_create_no_reparse(path: &Path) -> Result<OwnedHandle> {
     let (drive_root, components) = split_local_drive_path(path)?;
-    let (last, intermediates) = components
-        .split_last()
-        .with_context(|| format!("sandbox ACL path has no directory component: {}", path.display()))?;
+    let (last, intermediates) = components.split_last().with_context(|| {
+        format!(
+            "sandbox ACL path has no directory component: {}",
+            path.display()
+        )
+    })?;
 
     let mut parent = open_verified_volume_root(&drive_root, path)?;
     for component in intermediates {
@@ -234,8 +237,10 @@ fn open_verified_volume_root(drive_root: &[u16], path: &Path) -> Result<OwnedHan
             .with_context(|| format!("query sandbox ACL drive device {}", path.display()));
     }
     ensure!(
-        matches!(device.device_type, FILE_DEVICE_DISK | FILE_DEVICE_VIRTUAL_DISK)
-            && device.characteristics & FILE_REMOTE_DEVICE == 0,
+        matches!(
+            device.device_type,
+            FILE_DEVICE_DISK | FILE_DEVICE_VIRTUAL_DISK
+        ) && device.characteristics & FILE_REMOTE_DEVICE == 0,
         "sandbox ACL path must be on a local disk volume: {}",
         path.display()
     );
@@ -280,8 +285,8 @@ fn nt_open(
 ) -> Result<OwnedHandle> {
     let mut buffer: Vec<u16> = name.to_vec();
     buffer.push(0);
-    let name_length = u16::try_from(name.len() * size_of::<u16>())
-        .context("sandbox ACL path is too long")?;
+    let name_length =
+        u16::try_from(name.len() * size_of::<u16>()).context("sandbox ACL path is too long")?;
     let maximum_length =
         u16::try_from(buffer.len() * size_of::<u16>()).context("sandbox ACL path is too long")?;
     let object_name = UNICODE_STRING {

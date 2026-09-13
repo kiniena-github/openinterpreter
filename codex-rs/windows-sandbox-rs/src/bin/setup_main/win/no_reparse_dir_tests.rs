@@ -136,11 +136,16 @@ fn creates_plain_directory_on_drive_letter_path() -> Result<()> {
     for temporary in drive_letter_temp_dirs()? {
         let directory = temporary.path().join("home").join(".sandbox-bin");
         fs::create_dir(temporary.path().join("home"))?;
-        assert!(directory.components().next().is_some_and(|component| matches!(
-            component,
-            std::path::Component::Prefix(prefix)
-                if matches!(prefix.kind(), std::path::Prefix::Disk(_))
-        )));
+        assert!(
+            directory
+                .components()
+                .next()
+                .is_some_and(|component| matches!(
+                    component,
+                    std::path::Component::Prefix(prefix)
+                        if matches!(prefix.kind(), std::path::Prefix::Disk(_))
+                ))
+        );
 
         let handle = open_or_create_no_reparse(&directory)?;
 
@@ -227,7 +232,10 @@ fn rejects_deep_ancestor_directory_junction_on_every_test_drive() -> Result<()> 
         fs::create_dir_all(real.join("OpenInterpreter").join("home"))?;
         let linked = temporary.path().join("linked");
         create_directory_junction(&real, &linked)?;
-        let directory = linked.join("OpenInterpreter").join("home").join(".sandbox-bin");
+        let directory = linked
+            .join("OpenInterpreter")
+            .join("home")
+            .join(".sandbox-bin");
 
         let error = open_or_create_no_reparse(&directory)
             .expect_err("ancestor directory junction must be rejected");
@@ -236,7 +244,11 @@ fn rejects_deep_ancestor_directory_junction_on_every_test_drive() -> Result<()> 
             "unexpected error: {error:#}"
         );
         assert!(
-            !real.join("OpenInterpreter").join("home").join(".sandbox-bin").exists(),
+            !real
+                .join("OpenInterpreter")
+                .join("home")
+                .join(".sandbox-bin")
+                .exists(),
             "the final directory must not be created through the junction"
         );
         fs::remove_dir(&linked)?;
@@ -257,8 +269,8 @@ fn rejects_directory_symlink_component_when_symlinks_are_permitted() -> Result<(
 
     let _ = open_or_create_no_reparse(&linked.join("home").join(".sandbox-bin"))
         .expect_err("directory symlink component must be rejected");
-    let _ = open_or_create_no_reparse(&linked)
-        .expect_err("final directory symlink must be rejected");
+    let _ =
+        open_or_create_no_reparse(&linked).expect_err("final directory symlink must be rejected");
     assert!(!real.join("home").join(".sandbox-bin").exists());
     fs::remove_dir(&linked)?;
     Ok(())
