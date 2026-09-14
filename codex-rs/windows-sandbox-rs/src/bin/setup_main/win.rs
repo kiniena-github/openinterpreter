@@ -1,3 +1,4 @@
+mod explicit_dacl;
 mod firewall;
 mod no_reparse_dir;
 mod read_acl_mutex;
@@ -44,6 +45,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::mpsc;
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::LocalFree;
@@ -53,7 +55,6 @@ use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
 use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
 use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
 use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
-use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
@@ -72,6 +73,7 @@ const WRITE_ROOT_ALLOW_MASK: u32 =
 
 mod sandbox_users;
 mod setup_runtime_bin;
+use explicit_dacl::explicit_dacl_matches;
 use no_reparse_dir::open_or_create_no_reparse;
 use read_acl_mutex::acquire_read_acl_mutex;
 use read_acl_mutex::read_acl_mutex_exists;
@@ -294,6 +296,15 @@ fn read_mask_allows_or_log(
     }
 }
 
+fn is_access_denied(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            == Some(ERROR_ACCESS_DENIED as i32)
+    })
+}
+
 fn lock_sandbox_dir(
     dir: &Path,
     real_user: &str,
@@ -301,16 +312,15 @@ fn lock_sandbox_dir(
     sandbox_group_access_mode: i32,
     sandbox_group_mask: u32,
     real_user_mask: u32,
-    setup_mode: SetupMode,
 ) -> Result<()> {
-    // ProvisionOnly accepts another user's CODEX_HOME; keep its ACL mutation
-    // bound to a no-reparse handle without changing full setup behavior.
-    let directory = match setup_mode {
-        SetupMode::Full | SetupMode::ReadAclsOnly => {
-            std::fs::create_dir_all(dir)?;
-            None
-        }
-        SetupMode::ProvisionOnly => Some(open_or_create_no_reparse(dir)?),
+    // Every setup mode binds the ACL mutation to a directory opened without
+    // following a reparse point in any component; the parent directories must
+    // already exist. Access denied means the real user cannot obtain WRITE_DAC,
+    // typically because elevated setup already locked the directory.
+    let directory = match open_or_create_no_reparse(dir) {
+        Ok(directory) => Some(directory),
+        Err(err) if is_access_denied(&err) => None,
+        Err(err) => return Err(err),
     };
     let system_sid = resolve_sid("SYSTEM")?;
     let admins_sid = resolve_sid("Administrators")?;
@@ -372,9 +382,9 @@ fn lock_sandbox_dir(
                 "SetEntriesInAclW sandbox dir failed: {set}",
             ));
         }
-        let (res, api) = match directory.as_ref() {
-            Some(directory) => (
-                SetSecurityInfo(
+        let result = match directory.as_ref() {
+            Some(directory) => {
+                let res = SetSecurityInfo(
                     directory.as_raw_handle() as _,
                     SE_FILE_OBJECT,
                     DACL_SECURITY_INFORMATION,
@@ -382,28 +392,28 @@ fn lock_sandbox_dir(
                     std::ptr::null_mut(),
                     new_dacl,
                     std::ptr::null_mut(),
-                ),
-                "SetSecurityInfo",
-            ),
-            None => {
-                let path_w = to_wide(dir.as_os_str());
-                (
-                    SetNamedSecurityInfoW(
-                        path_w.as_ptr() as *mut u16,
-                        SE_FILE_OBJECT,
-                        DACL_SECURITY_INFORMATION,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        new_dacl,
-                        std::ptr::null_mut(),
-                    ),
-                    "SetNamedSecurityInfoW",
-                )
+                );
+                if res == 0 {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("SetSecurityInfo sandbox dir failed: {res}"))
+                }
             }
+            // Without WRITE_DAC the lock cannot be rewritten, so accept only a
+            // directory that, opened again without following any reparse point,
+            // already carries exactly the explicit ACEs this lock would write.
+            None => match explicit_dacl_matches(dir, new_dacl) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(anyhow::anyhow!(
+                    "sandbox dir {} denies WRITE_DAC and its existing DACL does not match the required lock",
+                    dir.display()
+                )),
+                Err(err) => Err(anyhow::anyhow!(
+                    "sandbox dir {} denies WRITE_DAC and its existing DACL could not be verified: {err:#}",
+                    dir.display()
+                )),
+            },
         };
-        if res != 0 {
-            return Err(anyhow::anyhow!("{api} sandbox dir failed: {res}"));
-        }
         if !new_dacl.is_null() {
             LocalFree(new_dacl as HLOCAL);
         }
@@ -412,8 +422,8 @@ fn lock_sandbox_dir(
                 LocalFree(sid as HLOCAL);
             }
         }
+        result
     }
-    Ok(())
 }
 
 pub fn main() -> Result<()> {
@@ -668,7 +678,6 @@ fn lock_persistent_sandbox_dirs(payload: &Payload, sandbox_group_sid: &[u8]) -> 
         GRANT_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
-        payload.mode,
     )
     .map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -686,7 +695,6 @@ fn lock_persistent_sandbox_dirs(payload: &Payload, sandbox_group_sid: &[u8]) -> 
         DENY_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
-        payload.mode,
     )
     .map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -712,7 +720,6 @@ fn lock_sandbox_bin_dir(payload: &Payload, sandbox_group_sid: &[u8]) -> Result<(
         GRANT_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-        payload.mode,
     )
     .map_err(|err| {
         anyhow::Error::new(SetupFailure::new(

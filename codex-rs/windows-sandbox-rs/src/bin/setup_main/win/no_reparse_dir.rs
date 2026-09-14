@@ -105,6 +105,22 @@ unsafe extern "system" {
 /// The returned handle must remain open through any security mutation so the
 /// mutation stays bound to the directory that passed this validation.
 pub(super) fn open_or_create_no_reparse(path: &Path) -> Result<OwnedHandle> {
+    open_no_reparse(
+        path,
+        // SetSecurityInfo can reject a WRITE_DAC-only directory handle.
+        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+        FILE_OPEN_IF,
+    )
+}
+
+/// Opens an existing final directory for reading its security descriptor, with
+/// the same no-reparse traversal as [`open_or_create_no_reparse`]. Nothing is
+/// created and no write access is requested.
+pub(super) fn open_existing_no_reparse_for_read_control(path: &Path) -> Result<OwnedHandle> {
+    open_no_reparse(path, READ_CONTROL | FILE_READ_ATTRIBUTES, FILE_OPEN)
+}
+
+fn open_no_reparse(path: &Path, final_access: u32, final_disposition: u32) -> Result<OwnedHandle> {
     let (drive_root, components) = split_local_drive_path(path)?;
     let (last, intermediates) = components.split_last().with_context(|| {
         format!(
@@ -125,14 +141,7 @@ pub(super) fn open_or_create_no_reparse(path: &Path) -> Result<OwnedHandle> {
             path,
         )?;
     }
-    open_component(
-        &parent,
-        last,
-        // SetSecurityInfo can reject a WRITE_DAC-only directory handle.
-        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
-        FILE_OPEN_IF,
-        path,
-    )
+    open_component(&parent, last, final_access, final_disposition, path)
 }
 
 /// Splits an absolute local drive path into its NT drive root (`\??\X:\`) and
